@@ -9203,6 +9203,7 @@ static void le_frame_space_update_complete_encode(struct pdu_data *pdu_data,
 	struct bt_hci_evt_le_frame_space_update_complete *sep;
 	struct ll_conn *conn;
 
+
 	if (!(event_mask & BT_EVT_MASK_LE_META_EVENT) ||
 	    !(le_event_mask & BT_EVT_MASK_LE_FRAME_SPACE_UPDATE_COMPLETE)) {
 		return;

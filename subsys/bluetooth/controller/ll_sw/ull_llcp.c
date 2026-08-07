@@ -967,6 +967,16 @@ uint8_t ull_cp_fsu(struct ll_conn *conn, uint16_t fsu_min, uint16_t fsu_max,
 
 	ull_fsu_local_tx_update(conn, fsu_min, fsu_max, phys, spacing_type);
 
+	/* M0 transitional receive window (initiator side): the responder
+	 * adopts the selected spacing BEFORE transmitting its RSP, so the
+	 * RSP itself can arrive at any spacing down to the requested
+	 * minimum. Enable RX early now; the header timeout keeps covering
+	 * the old spacing (not shrunk here), so both timings are heard.
+	 */
+	if (fsu_min < conn->lll.tifs_rx_us) {
+		conn->lll.tifs_rx_us = fsu_min;
+	}
+
 	llcp_lr_enqueue(conn, ctx);
 
 	return BT_HCI_ERR_SUCCESS;
