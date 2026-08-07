@@ -2863,8 +2863,14 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 
 	fsu_changed = ull_fsu_update_eff_from_local(conn);
 
-	if (fsu_changed) {
-		/* TODO: confirm that we do not need to do something here? */
+	/* Mirror the request's masks into the effective state BEFORE any
+	 * clearing below: the RSP and the notification encoders read from
+	 * eff (the request-scratch local.* fields are cleared once applied,
+	 * which used to zero the masks inside the RSP itself).
+	 */
+	if (conn->lll.fsu.local.phys || conn->lll.fsu.local.spacing_type) {
+		conn->lll.fsu.eff.phys = conn->lll.fsu.local.phys;
+		conn->lll.fsu.eff.spacing_type = conn->lll.fsu.local.spacing_type;
 	}
 
 	if ((conn->lll.fsu.local.spacing_type & T_IFS_CIS) == T_IFS_CIS) {
@@ -2891,7 +2897,15 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 					fsu_changed = 1;
 				}
 				conn->lll.tifs_rx_us = conn->lll.fsu.eff.fsu_min;
-				conn->lll.tifs_hcto_us = conn->lll.fsu.eff.fsu_min;
+				/* M0 transitional receive window: RX enables at
+				 * the new (reduced) spacing, but the header
+				 * timeout stays at the old/default spacing so
+				 * a peer that has not yet adopted is still
+				 * heard (the spec's transitional windows).
+				 */
+				conn->lll.tifs_hcto_us =
+					MAX(EVENT_IFS_DEFAULT_US,
+					    conn->lll.fsu.eff.fsu_min);
 			}
 		}
 	}
@@ -2904,7 +2918,10 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 					fsu_changed = 1;
 				}
 				conn->lll.tifs_rx_us = conn->lll.fsu.eff.fsu_min;
-				conn->lll.tifs_hcto_us = conn->lll.fsu.eff.fsu_min;
+				/* Transitional window: see comment above. */
+				conn->lll.tifs_hcto_us =
+					MAX(EVENT_IFS_DEFAULT_US,
+					    conn->lll.fsu.eff.fsu_min);
 			}
 		} else {
 			if (conn->lll.fsu.local.phys & phy_tx) {
@@ -2917,11 +2934,6 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 		}
 	}
 	if (fsu_changed == 1) {
-		/* Preserve what changed for the notification encoder before
-		 * clearing the request-scratch fields.
-		 */
-		conn->lll.fsu.eff.phys = conn->lll.fsu.local.phys;
-		conn->lll.fsu.eff.spacing_type = conn->lll.fsu.local.spacing_type;
 		conn->lll.fsu.local.phys = 0;
 		conn->lll.fsu.local.spacing_type = 0;
 	}
@@ -2969,6 +2981,8 @@ uint8_t ull_fsu_init(struct ll_conn *conn)
 	conn->lll.fsu.local.fsu_max = EVENT_IFS_MAX_US;
 	conn->lll.fsu.eff.fsu_min = EVENT_IFS_US;
 	conn->lll.fsu.eff.fsu_max = EVENT_IFS_US;
+	conn->lll.fsu.eff.phys = 0x07;
+	conn->lll.fsu.eff.spacing_type = T_IFS_ACL_PC | T_IFS_ACL_CP;
 	for (size_t i = 0; i < 3; i++) {
 		conn->lll.fsu.perphy[i].fsu_min = EVENT_IFS_US;
 		conn->lll.fsu.perphy[i].fsu_max = EVENT_IFS_US;
