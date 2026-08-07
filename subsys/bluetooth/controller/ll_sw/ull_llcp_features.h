@@ -70,6 +70,15 @@ static inline bool feature_dle(struct ll_conn *conn)
 
 static inline bool feature_fsu(struct ll_conn *conn)
 {
+	/* Feature bit 65 exceeds the 64-bit LLCP feature mask; the real
+	 * Extended Feature Set exchange is M1 work. Under the documented
+	 * M0 bench shim the feature is forced known-supported (peer
+	 * without support answers UNKNOWN_RSP -> clean termination).
+	 */
+	if (IS_ENABLED(CONFIG_BT_CTLR_FSU_BENCH_FORCE_FEAT)) {
+		return true;
+	}
+
 	return (conn->llcp.fex.features_used & LL_FEAT_BIT_FRAME_SPACE) != 0;
 }
 
