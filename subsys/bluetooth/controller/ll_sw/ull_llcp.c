@@ -948,8 +948,16 @@ uint8_t ull_cp_fsu(struct ll_conn *conn, uint16_t fsu_min, uint16_t fsu_max,
 {
 	struct proc_ctx *ctx;
 
+	/* Range validation: min<=max, and an upper bound of 10 ms per the
+	 * public feature descriptions (exact spec bound to be re-verified
+	 * when the spec text is directly quotable - cheat-sheet item).
+	 */
+	if ((fsu_min > fsu_max) || (fsu_max > 10000U)) {
+		return BT_HCI_ERR_INVALID_PARAM;
+	}
+
 	if (!feature_fsu(conn)) {
-		return BT_HCI_ERR_SUCCESS;
+		return BT_HCI_ERR_UNSUPP_REMOTE_FEATURE;
 	}
 
 	ctx = llcp_create_local_procedure(PROC_FRAME_SPACE);

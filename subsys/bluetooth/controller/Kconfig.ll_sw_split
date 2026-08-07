@@ -37,6 +37,8 @@ config BT_LLL_VENDOR_NORDIC
 	select BT_CTLR_PHY_CODED_SUPPORT if HAS_HW_NRF_RADIO_BLE_CODED
 	select BT_CTLR_PHY_UPDATE_SUPPORT if BT_CTLR_PHY_2M_SUPPORT || \
 					     BT_CTLR_PHY_CODED_SUPPORT
+	select BT_CTLR_FRAME_SPACE_UPDATE_SUPPORT
+	select BT_CTLR_EXTENDED_FEAT_SET_SUPPORT
 	select BT_CTLR_ADV_EXT_SUPPORT
 	select BT_CTLR_ADV_PERIODIC_SUPPORT
 	select BT_CTLR_SYNC_PERIODIC_SUPPORT
@@ -1504,3 +1506,14 @@ config BT_CTLR_DEBUG_PINS
 	  the code.
 
 endif # BT_LL_SW_SPLIT
+
+config BT_CTLR_FSU_BENCH_FORCE_FEAT
+	bool "BENCH-ONLY: force Frame Space Update feature known-supported"
+	depends on BT_CTLR_FRAME_SPACE_UPDATE
+	help
+	  NON-CONFORMANT bench shim (M0): treats the peer as FSU-capable
+	  without a real Extended Feature Set page exchange (feature bit 65
+	  exceeds the classic 64-bit LLCP feature mask). A non-supporting
+	  peer answers LL_FRAME_SPACE_REQ with LL_UNKNOWN_RSP, which this
+	  implementation handles as clean procedure termination. Never
+	  enable outside the open<->open bench rig.

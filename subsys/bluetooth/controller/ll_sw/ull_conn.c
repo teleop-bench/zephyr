@@ -2853,13 +2853,13 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 	uint8_t phy_tx;
 	uint8_t phy_rx;
 
-#if defined(CONFIG_BT_PHY_UPDATE)
+#if defined(CONFIG_BT_CTLR_PHY)
 	phy_tx = conn->lll.phy_tx;
 	phy_rx = conn->lll.phy_rx;
 #else
 	phy_tx = PHY_1M;
 	phy_rx = PHY_1M;
-#endif /* CONFIG_BT_PHY_UPDATE */
+#endif /* CONFIG_BT_CTLR_PHY */
 
 	fsu_changed = ull_fsu_update_eff_from_local(conn);
 
@@ -2869,7 +2869,7 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 
 	if ((conn->lll.fsu.local.spacing_type & T_IFS_CIS) == T_IFS_CIS) {
 
-		if (conn->lll.tifs_cis_us == conn->lll.fsu.eff.fsu_min) {
+		if (conn->lll.tifs_cis_us != conn->lll.fsu.eff.fsu_min) {
 			fsu_changed = 1;
 		}
 		conn->lll.tifs_cis_us = conn->lll.fsu.eff.fsu_min;
@@ -2878,7 +2878,7 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 	if ((conn->lll.fsu.local.spacing_type & T_IFS_ACL_CP) == T_IFS_ACL_CP) {
 		if (conn->lll.role == BT_HCI_ROLE_PERIPHERAL) {
 			if (conn->lll.fsu.local.phys & phy_tx) {
-				if (conn->lll.tifs_tx_us ==
+				if (conn->lll.tifs_tx_us !=
 				    conn->lll.fsu.eff.fsu_min) {
 					fsu_changed = 1;
 				}
@@ -2886,11 +2886,12 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 			}
 		} else {
 			if (conn->lll.fsu.local.phys & phy_rx) {
-				if (conn->lll.tifs_rx_us ==
+				if (conn->lll.tifs_rx_us !=
 				    conn->lll.fsu.eff.fsu_min) {
 					fsu_changed = 1;
 				}
 				conn->lll.tifs_rx_us = conn->lll.fsu.eff.fsu_min;
+				conn->lll.tifs_hcto_us = conn->lll.fsu.eff.fsu_min;
 			}
 		}
 	}
@@ -2898,15 +2899,16 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 	if ((conn->lll.fsu.local.spacing_type & T_IFS_ACL_PC) == T_IFS_ACL_PC) {
 		if (conn->lll.role == BT_HCI_ROLE_PERIPHERAL) {
 			if (conn->lll.fsu.local.phys & phy_rx) {
-				if (conn->lll.tifs_rx_us ==
+				if (conn->lll.tifs_rx_us !=
 				    conn->lll.fsu.eff.fsu_min) {
 					fsu_changed = 1;
 				}
 				conn->lll.tifs_rx_us = conn->lll.fsu.eff.fsu_min;
+				conn->lll.tifs_hcto_us = conn->lll.fsu.eff.fsu_min;
 			}
 		} else {
 			if (conn->lll.fsu.local.phys & phy_tx) {
-				if (conn->lll.tifs_tx_us ==
+				if (conn->lll.tifs_tx_us !=
 				    conn->lll.fsu.eff.fsu_min) {
 					fsu_changed = 1;
 				}
@@ -2915,6 +2917,11 @@ uint8_t ull_fsu_update_eff(struct ll_conn *conn)
 		}
 	}
 	if (fsu_changed == 1) {
+		/* Preserve what changed for the notification encoder before
+		 * clearing the request-scratch fields.
+		 */
+		conn->lll.fsu.eff.phys = conn->lll.fsu.local.phys;
+		conn->lll.fsu.eff.spacing_type = conn->lll.fsu.local.spacing_type;
 		conn->lll.fsu.local.phys = 0;
 		conn->lll.fsu.local.spacing_type = 0;
 	}
