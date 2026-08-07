@@ -1139,6 +1139,24 @@ config BT_CTLR_TX_DEFER
 	  enqueued ACL Data packet by the upper layer can be transmitted with
 	  the shortest latency.
 
+config BT_CTLR_INEVENT_ECHO
+	bool "In-event echo reply (EXPERIMENTAL, non-spec, single-connection probe only)"
+	depends on BT_PERIPHERAL
+	help
+	  When the peripheral receives a marked "ping" ACL PDU (an ATT Write Command
+	  on the ATT fixed channel), the controller stages a precomputed "pong" reply
+	  (the same PDU with the ATT opcode rewritten to Handle Value Notification) as
+	  the answering PDU in the SAME connection event's RX->TX turnaround, bypassing
+	  the host. This removes one connection-interval of round-trip latency (the host
+	  would otherwise reply on the next interval).
+
+	  LIMITATIONS (this is a research probe, not a general feature):
+	    - Echo state is file-global -> supports ONE connection only.
+	    - Matches ANY ATT Write Command on the ATT channel, not a specific
+	      attribute handle.
+	    - Non-spec; closed-link only (BOTH ends must run this controller).
+	  Do not enable outside a dedicated two-device experiment. Experimental.
+
 config BT_CTLR_THROUGHPUT
 	bool "Measure incoming Tx throughput"
 	default y if BT_HCI_RAW
