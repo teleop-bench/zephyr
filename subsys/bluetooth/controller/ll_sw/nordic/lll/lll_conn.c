@@ -55,6 +55,37 @@ static void isr_tx_deferred_set(void *param);
 
 static void empty_tx_init(void);
 
+#if defined(CONFIG_BT_CTLR_INEVENT_ECHO)
+/* In-event echo: a "pong" reply staged in the RX ISR and transmitted in the SAME
+ * connection event's RX->TX turnaround, riding the empty-PDU accounting so it needs no
+ * memq_tx node, no memq_link, and never enters the ULL/host tx-completion path (which for
+ * a data PDU would signal the host a completion for a packet it never sent). Single static
+ * slot => probe supports ONE connection; per-connection state is a TODO for upstream. */
+#define ECHO_ATT_CID_LO    0x04U  /* L2CAP CID 0x0004 = ATT, little-endian */
+#define ECHO_ATT_CID_HI    0x00U
+#define ECHO_ATT_WRITE_CMD 0x52U  /* ping: ATT Write Command */
+#define ECHO_ATT_NOTIFY    0x1BU  /* pong: ATT Handle Value Notification */
+#define ECHO_LLDATA_MAX    40U    /* upper bound on echoed payload (buffer-overflow guard) */
+static union {
+	struct pdu_data pdu;
+	uint8_t _pad[sizeof(struct pdu_data) + ECHO_LLDATA_MAX];
+} echo_store;
+#define echo_pdu (echo_store.pdu)
+static bool echo_staged;
+/* Ownership instrumentation (read via debugger / lll_conn_echo_stats). */
+static uint32_t echo_rx_cnt;   /* pings matched + staged */
+static uint32_t echo_tx_cnt;   /* pongs injected into the turnaround */
+static uint32_t echo_inject_with_pending; /* echo rode empty while a REAL memq_tx PDU was queued */
+static uint32_t echo_stale_cleared;       /* staged echo dropped at event/connection reset (never sent) */
+void lll_conn_echo_stats(uint32_t *rx, uint32_t *tx, uint32_t *pending, uint32_t *stale)
+{
+	if (pending) { *pending = echo_inject_with_pending; }
+	if (stale) { *stale = echo_stale_cleared; }
+	if (rx) { *rx = echo_rx_cnt; }
+	if (tx) { *tx = echo_tx_cnt; }
+}
+#endif /* CONFIG_BT_CTLR_INEVENT_ECHO */
+
 #if defined(CONFIG_BT_CTLR_DF_CONN_CTE_RX)
 static inline bool create_iq_report(struct lll_conn *lll, uint8_t rssi_ready,
 				    uint8_t packet_status);
@@ -156,10 +187,32 @@ void lll_conn_prepare_reset(void)
 	is_aborted = 0U;
 	trx_busy_iteration = 0U;
 
+#if defined(CONFIG_BT_CTLR_INEVENT_ECHO)
+	/* Point 7: drop any echo staged in a prior event but never transmitted (e.g. the event was
+	 * aborted, or the connection dropped) so a STALE pong can't cross into the next event/connection
+	 * and corrupt startup accounting. The current event stages its echo AFTER this reset (in the RX
+	 * ISR), so legitimate same-event echoes are unaffected. NOTE: file-global single-slot echo state
+	 * still supports only ONE connection (per-connection state remains a TODO). */
+	if (echo_staged) {
+		echo_staged = false;
+		echo_stale_cleared++;
+	}
+#endif /* CONFIG_BT_CTLR_INEVENT_ECHO */
+
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	mic_state = LLL_CONN_MIC_NONE;
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 }
+
+/* DIAGNOSTIC (assert-disabled fault-injection, 2026-08-01): counts how often the
+ * trx_busy_iteration cap is hit — i.e. the path that used to LL_ASSERT_DBG and halt.
+ * With CONFIG_BT_CTLR_ASSERT_DEBUG=n that assert is a no-op and the code falls through
+ * to `return -ECANCELED` (cancels this one overrunning event instead of halting). NOTE: this
+ * return path alone is not shown to *preserve* the connection — measurements (§13.15) show the
+ * link can still fail/supervision-timeout; it only avoids the fatal assert. Non-static so the app
+ * can read it. Increment condition == the pre-patch assert-fail condition exactly:
+ * !(trx_busy_iteration < *_TRX_BUSY_ITERATION_MAX). */
+uint32_t volatile lll_conn_trx_busy_cancels;
 
 #if defined(CONFIG_BT_CENTRAL)
 /* Number of times central event being aborted by same event instance be skipped */
@@ -189,6 +242,9 @@ int lll_conn_central_is_abort_cb(void *next, void *curr,
 		return -EBUSY;
 	}
 
+	if (trx_busy_iteration >= CENTRAL_TRX_BUSY_ITERATION_MAX) {
+		lll_conn_trx_busy_cancels++;   /* diagnostic: cancel path taken (was: assert+halt) */
+	}
 	LL_ASSERT_DBG(trx_busy_iteration < CENTRAL_TRX_BUSY_ITERATION_MAX);
 
 	return -ECANCELED;
@@ -223,6 +279,9 @@ int lll_conn_peripheral_is_abort_cb(void *next, void *curr,
 		return -EBUSY;
 	}
 
+	if (trx_busy_iteration >= PERIPHERAL_TRX_BUSY_ITERATION_MAX) {
+		lll_conn_trx_busy_cancels++;   /* diagnostic: cancel path taken (was: assert+halt) */
+	}
 	LL_ASSERT_DBG(trx_busy_iteration < PERIPHERAL_TRX_BUSY_ITERATION_MAX);
 
 	return -ECANCELED;
@@ -396,6 +455,34 @@ void lll_conn_isr_rx(void *param)
 
 		/* CRC valid flag used to detect supervision timeout */
 		crc_valid = 1U;
+
+#if defined(CONFIG_BT_CTLR_INEVENT_ECHO)
+		/* In-event echo: if this RX is a "ping" (a complete, non-fragmented ATT
+		 * Write Command on the ATT fixed channel), stage a "pong" (same PDU, opcode
+		 * -> Handle Value Notification) to transmit in THIS event's turnaround.
+		 * Near-zero work: a bounded, validated memcpy. Safe-matcher requirements:
+		 * LLID=START (not a continuation fragment), 7 <= len <= ECHO_LLDATA_MAX
+		 * (opcode+handle present, no overflow), and the L2CAP length field matches
+		 * the PDU (a whole SDU, not a fragment). Handle is preserved from the ping.
+		 * TODO(upstream): restrict to a single configured attribute handle. */
+		if ((pdu_data_rx->ll_id == PDU_DATA_LLID_DATA_START) &&
+		    (pdu_data_rx->len >= 7U) &&
+		    (pdu_data_rx->len <= ECHO_LLDATA_MAX) &&
+		    (((uint16_t)pdu_data_rx->lldata[0] |
+		      ((uint16_t)pdu_data_rx->lldata[1] << 8)) ==
+		     (uint16_t)(pdu_data_rx->len - 4U)) &&
+		    (pdu_data_rx->lldata[2] == ECHO_ATT_CID_LO) &&
+		    (pdu_data_rx->lldata[3] == ECHO_ATT_CID_HI) &&
+		    (pdu_data_rx->lldata[4] == ECHO_ATT_WRITE_CMD)) {
+			echo_pdu.ll_id = PDU_DATA_LLID_DATA_START;
+			echo_pdu.md = 0U;
+			echo_pdu.len = pdu_data_rx->len;
+			memcpy(echo_pdu.lldata, pdu_data_rx->lldata, pdu_data_rx->len);
+			echo_pdu.lldata[4] = ECHO_ATT_NOTIFY;
+			echo_staged = true;
+			echo_rx_cnt++;
+		}
+#endif /* CONFIG_BT_CTLR_INEVENT_ECHO */
 	} else {
 		/* Start CRC error countdown, if not already started */
 		if (crc_expire == 0U) {
@@ -952,6 +1039,29 @@ void lll_conn_pdu_tx_prep(struct lll_conn *lll, struct pdu_data **pdu_data_tx)
 	struct node_tx *tx;
 	struct pdu_data *p;
 	memq_link_t *link;
+
+#if defined(CONFIG_BT_CTLR_INEVENT_ECHO)
+	/* In-event echo: a ping was just received this event -> answer with the staged pong
+	 * now, in the same turnaround. Ride the EMPTY-PDU accounting: set lll->empty so the
+	 * peer's ACK next event takes the empty branch (no memq_tx dequeue/free, no ULL/host
+	 * tx-completion) while the radio still transmits our data-bearing echo_pdu. sn/nesn are
+	 * filled by the caller; sn advances on ACK exactly as for an empty PDU. */
+	if (echo_staged) {
+		struct node_tx *pend_tx;
+
+		echo_staged = false;
+		lll->empty = 1U;
+		echo_tx_cnt++;
+		/* DIAGNOSTIC (point 8): was a REAL tx PDU already queued when the echo rode empty?
+		 * If so, that PDU (possibly an LL control PDU, e.g. the conn-param-update) is deferred
+		 * this event -> a candidate cause of the startup wedge. */
+		if (memq_peek(lll->memq_tx.head, lll->memq_tx.tail, (void **)&pend_tx)) {
+			echo_inject_with_pending++;
+		}
+		*pdu_data_tx = &echo_pdu;
+		return;
+	}
+#endif /* CONFIG_BT_CTLR_INEVENT_ECHO */
 
 	link = memq_peek(lll->memq_tx.head, lll->memq_tx.tail, (void **)&tx);
 	if (lll->empty || !link) {
