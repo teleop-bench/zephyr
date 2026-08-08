@@ -106,22 +106,33 @@ static uint16_t trx_cnt;
 /* §6.1 BENCH-ONLY (M0): read the controller's SHARED EVENT_TIMER CC0 at the
  * start of lll_conn_isr_tx. With SW_SWITCH_SINGLE_TIMER the RX PHYEND clears
  * the timebase, so CC0 (radio_tmr_ready_get()) IS the RX-PHYEND->TX-READY
- * interval (a hardware-event timing PROXY, stops before the on-air TX bit;
- * NOT on-air). No printing in the ISR: fixed-size records to a static ring,
- * drained from thread context. Freshness-gated on a CRC-valid RX. */
-struct tifs_rec {
-	uint16_t cc0_us;      /* RX-PHYEND -> TX-READY interval */
-	uint16_t tifs_tx_us;  /* configured spacing this event */
-	uint8_t  phy;         /* lll->phy_tx */
-	uint8_t  valid;       /* fresh CRC-valid RX preceded */
-	uint32_t seq;         /* event sequence for pairing audit */
+ * interval of the switch that JUST completed (a hardware-event timing PROXY,
+ * stops before the on-air TX bit; NOT on-air).
+ *
+ * PAIRING (rev 2): CC0 describes the RX->TX switch that just completed;
+ * lll->tifs_tx_us read in isr_tx programs the NEXT switch. So the tifs that
+ * PRODUCED this CC0 is the one latched at the PREVIOUS isr_tx -> keep
+ * `tifs_prog_prev`. Record (CC0, tifs_prog_prev), then latch the current
+ * value for the next event.
+ *
+ * OUTPUT (rev 2): no ring/print in the ISR (overflowed silently, ~130/s vs
+ * a ~13/s drain). Instead ISR-side LOSSLESS per-tifs-value bins with a
+ * coarse CC0 histogram; drained/formatted from thread context. */
+#define TIFS_NBINS   4U
+#define TIFS_NHIST   9U          /* buckets of 20 us: [0,20)...[160,inf) */
+struct tifs_bin {
+	uint16_t tifs;               /* programmed spacing that produced CC0 */
+	uint8_t  phy;
+	uint8_t  used;
+	uint32_t n_total;
+	uint32_t n_valid;            /* fresh CRC-valid RX preceded */
+	uint16_t cc0_min, cc0_max;   /* over valid records */
+	uint32_t hist[TIFS_NHIST];   /* CC0 histogram over valid records */
 };
-#define TIFS_RING_N 256U
-static struct tifs_rec tifs_ring[TIFS_RING_N];
-static volatile uint32_t tifs_head;   /* ISR writes */
-static uint32_t tifs_tail;            /* thread drains */
-static uint8_t tifs_fresh;            /* set in isr_rx on CRC-valid RX */
-static uint32_t tifs_seq;
+static struct tifs_bin tifs_bins[TIFS_NBINS];
+static uint8_t  tifs_fresh;      /* set in isr_rx on CRC-valid RX */
+static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150 at start */
+static uint32_t tifs_dropped;    /* records that found no free bin */
 
 static inline void tifs_on_rx_crc_ok(void)
 {
@@ -131,40 +142,85 @@ static inline void tifs_on_rx_crc_ok(void)
 static inline void tifs_on_tx(struct lll_conn *lll)
 {
 	uint32_t cc0 = radio_tmr_ready_get();
-	struct tifs_rec *r = &tifs_ring[tifs_head & (TIFS_RING_N - 1U)];
-
-	r->cc0_us = (cc0 > 60000U) ? 0xFFFFU : (uint16_t)cc0;
-	r->tifs_tx_us = lll->tifs_tx_us;
+	uint16_t cc = (cc0 > 60000U) ? 0xFFFFU : (uint16_t)cc0;
+	uint16_t tifs = tifs_prog_prev;   /* the value that PRODUCED this CC0 */
 #if defined(CONFIG_BT_CTLR_PHY)
-	r->phy = lll->phy_tx;
+	uint8_t phy = lll->phy_tx;
 #else
-	r->phy = 1U;
+	uint8_t phy = 1U;
 #endif
-	r->valid = tifs_fresh;   /* only fresh CRC-valid RX -> TX turnarounds count */
-	r->seq = tifs_seq++;
-	tifs_head++;
+	struct tifs_bin *b = NULL;
+
+	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
+		if (tifs_bins[i].used && tifs_bins[i].tifs == tifs &&
+		    tifs_bins[i].phy == phy) {
+			b = &tifs_bins[i];
+			break;
+		}
+		if (!tifs_bins[i].used && b == NULL) {
+			b = &tifs_bins[i];
+		}
+	}
+	if (b == NULL) {
+		tifs_dropped++;
+	} else {
+		if (!b->used) {
+			b->used = 1U;
+			b->tifs = tifs;
+			b->phy = phy;
+			b->cc0_min = 0xFFFFU;
+		}
+		b->n_total++;
+		if (tifs_fresh) {
+			uint32_t h = cc / 20U;
+
+			if (h >= TIFS_NHIST) {
+				h = TIFS_NHIST - 1U;
+			}
+			b->hist[h]++;
+			b->n_valid++;
+			if (cc < b->cc0_min) {
+				b->cc0_min = cc;
+			}
+			if (cc > b->cc0_max) {
+				b->cc0_max = cc;
+			}
+		}
+	}
+
+	/* latch the value isr_tx is about to program (line below) for the
+	 * NEXT event's CC0. */
+	tifs_prog_prev = lll->tifs_tx_us;
 	tifs_fresh = 0U;
 }
 
-/* Drained + formatted from thread/ULL context (app calls this and printk's
- * the buffer). Keeps the record struct private to the controller. Emits one
- * compact line per record; returns bytes written. */
+/* Drained + formatted from thread ctx (app printk's the buffer). Emits one
+ * line per active bin: programmed tifs, phy, totals, valid CC0 min/max, and
+ * the histogram (median derivable); plus a global dropped counter. Bins are
+ * left in place (cumulative) so a late-connecting reader still sees them. */
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen);
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 {
 	uint32_t used = 0U;
 
-	while (tifs_tail != tifs_head && (buflen - used) > 64U) {
-		struct tifs_rec *r = &tifs_ring[tifs_tail & (TIFS_RING_N - 1U)];
-		int w = snprintf(&buf[used], buflen - used,
-				 "TIFS cc0=%u tifs=%u phy=%u v=%u seq=%u\n",
-				 r->cc0_us, r->tifs_tx_us, r->phy, r->valid,
-				 r->seq);
-		if (w <= 0) {
-			break;
+	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
+		struct tifs_bin *b = &tifs_bins[i];
+		int w;
+
+		if (!b->used || (buflen - used) < 140U) {
+			continue;
 		}
-		used += (uint32_t)w;
-		tifs_tail++;
+		w = snprintf(&buf[used], buflen - used,
+			     "TIFSBIN tifs=%u phy=%u n=%u nv=%u min=%u max=%u "
+			     "hist=%u,%u,%u,%u,%u,%u,%u,%u,%u drop=%u\n",
+			     b->tifs, b->phy, b->n_total, b->n_valid,
+			     b->cc0_min, b->cc0_max,
+			     b->hist[0], b->hist[1], b->hist[2], b->hist[3],
+			     b->hist[4], b->hist[5], b->hist[6], b->hist[7],
+			     b->hist[8], tifs_dropped);
+		if (w > 0) {
+			used += (uint32_t)w;
+		}
 	}
 	return used;
 }
