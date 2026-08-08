@@ -134,7 +134,8 @@ struct tifs_bin {
 };
 static struct tifs_bin tifs_bins[TIFS_NBINS];
 static uint8_t  tifs_fresh;      /* set in isr_rx on CRC-valid RX */
-static uint8_t  tifs_prime;      /* skip the first transition after connect */
+static uint8_t  tifs_prime;      /* skip the first post-clear transition */
+static uint8_t  tifs_capturing;  /* 1 = aggregate; 0 = frozen (drain-safe) */
 static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150, stale at start */
 static uint32_t tifs_dropped;    /* no free bin, or CC0 out of 0..255 range */
 
@@ -154,8 +155,18 @@ static inline void tifs_on_tx(struct lll_conn *lll)
 #endif
 	struct tifs_bin *b = NULL;
 
-	/* Skip the first paired transition after a (re)connection: at that
-	 * point tifs_prog_prev is stale (init 150 / previous connection). */
+	/* Frozen (drain in progress or run ended): keep the pairing latch
+	 * current but do not touch the bins the thread is reading. */
+	if (!tifs_capturing) {
+		tifs_prog_prev = lll->tifs_tx_us;
+		tifs_fresh = 0U;
+		return;
+	}
+
+	/* Skip the FIRST post-clear transition: tifs_prog_prev is stale
+	 * (from before the clear / a previous connection). NOTE: primed only
+	 * by bt_ctlr_tifs_clear(); runs are reset-isolated (one connection),
+	 * and a mid-run reconnect is rejected at analysis (disc must be 0). */
 	if (tifs_prime) {
 		tifs_prime = 0U;
 		tifs_prog_prev = lll->tifs_tx_us;
@@ -192,37 +203,53 @@ static inline void tifs_on_tx(struct lll_conn *lll)
 	tifs_fresh = 0U;
 }
 
-/* Atomically clear all bins + counters. App calls this AFTER the 2 s
- * post-FSU settle so only post-settle transitions aggregate; also prime the
- * first-transition skip. */
+/* Start/restart capture after the post-FSU settle so only post-settle
+ * transitions aggregate. Freeze-then-clear-then-enable: the 4 KB memset is
+ * done OUTSIDE the lock (capture briefly off), so the lock is held only for
+ * two tiny flag flips — never for a KB-scale copy on the radio path. */
 void bt_ctlr_tifs_clear(void);
 void bt_ctlr_tifs_clear(void)
 {
 	unsigned int key = irq_lock();
 
-	(void)memset(tifs_bins, 0, sizeof(tifs_bins));
+	tifs_capturing = 0U;             /* freeze (tiny) */
+	irq_unlock(key);
+
+	(void)memset(tifs_bins, 0, sizeof(tifs_bins));   /* outside lock */
 	tifs_dropped = 0U;
+
+	key = irq_lock();
 	tifs_prime = 1U;
+	tifs_capturing = 1U;             /* enable (tiny) */
 	irq_unlock(key);
 }
 
-/* Snapshot under irq_lock(), format after unlock. Emits per active bin:
- * programmed tifs, phy, totals, exact CC0 min/median/max, and drop count.
- * drop MUST be 0 for acceptance. */
+/* Freeze capture (tiny locked flag change). Call at run END before drain;
+ * after this the ISR does not touch the bins, so the drain reads them
+ * directly with NO lock and NO live copy. */
+void bt_ctlr_tifs_freeze(void);
+void bt_ctlr_tifs_freeze(void)
+{
+	unsigned int key = irq_lock();
+
+	tifs_capturing = 0U;
+	irq_unlock(key);
+}
+
+/* Format the FROZEN bins (call bt_ctlr_tifs_freeze() first). Emits per
+ * active bin: programmed tifs, phy, totals, exact CC0 min / LOWER-median /
+ * max, and drop count. drop MUST be 0 for acceptance. LOWER median = the
+ * first value whose cumulative count reaches ceil(n_valid/2) (documented in
+ * PREREG-TIMER.md; the ~1 us even/odd convention is immaterial vs a ~98 us
+ * delta). */
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen);
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 {
-	static struct tifs_bin snap[TIFS_NBINS];
-	uint32_t drop;
+	uint32_t drop = tifs_dropped;
 	uint32_t used = 0U;
-	unsigned int key = irq_lock();
-
-	(void)memcpy(snap, tifs_bins, sizeof(snap));
-	drop = tifs_dropped;
-	irq_unlock(key);
 
 	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
-		struct tifs_bin *b = &snap[i];
+		struct tifs_bin *b = &tifs_bins[i];
 		uint32_t cum = 0U, mn = 0xFFFFU, mx = 0U, med = 0U;
 		int w;
 
