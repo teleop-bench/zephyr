@@ -103,36 +103,40 @@ static uint16_t trx_cnt;
 
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
 #include <stdio.h>
-/* §6.1 BENCH-ONLY (M0): read the controller's SHARED EVENT_TIMER CC0 at the
- * start of lll_conn_isr_tx. With SW_SWITCH_SINGLE_TIMER the RX PHYEND clears
- * the timebase, so CC0 (radio_tmr_ready_get()) IS the RX-PHYEND->TX-READY
- * interval of the switch that JUST completed (a hardware-event timing PROXY,
- * stops before the on-air TX bit; NOT on-air).
+#include <zephyr/irq.h>
+/* §6.1 BENCH-ONLY (M0), rev 3. Read the controller's SHARED EVENT_TIMER CC0
+ * at the start of lll_conn_isr_tx. With SW_SWITCH_SINGLE_TIMER the RX PHYEND
+ * clears the timebase, so CC0 (radio_tmr_ready_get()) IS the RX-PHYEND->
+ * TX-READY interval of the switch that JUST completed (a hardware-event
+ * timing PROXY, stops before the on-air TX bit; NOT on-air).
  *
- * PAIRING (rev 2): CC0 describes the RX->TX switch that just completed;
- * lll->tifs_tx_us read in isr_tx programs the NEXT switch. So the tifs that
- * PRODUCED this CC0 is the one latched at the PREVIOUS isr_tx -> keep
- * `tifs_prog_prev`. Record (CC0, tifs_prog_prev), then latch the current
- * value for the next event.
+ * PAIRING: CC0 is the switch that just completed; lll->tifs_tx_us read in
+ * isr_tx programs the NEXT switch. The tifs that PRODUCED this CC0 is the
+ * one latched at the PREVIOUS isr_tx -> `tifs_prog_prev`.
  *
- * OUTPUT (rev 2): no ring/print in the ISR (overflowed silently, ~130/s vs
- * a ~13/s drain). Instead ISR-side LOSSLESS per-tifs-value bins with a
- * coarse CC0 histogram; drained/formatted from thread context. */
+ * AGGREGATION (rev 3): EXACT 1 us bins (CC0 0..255) so the preregistered
+ * MEDIAN is exact at ~1 us resolution. Per (tifs, phy) bin. BOUNDED with
+ * EXPLICIT LOSS ACCOUNTING (not "lossless"): a record with no free bin (all
+ * TIFS_NBINS occupied) or CC0>255 increments a drop counter; acceptance
+ * REQUIRES drop=0. bt_ctlr_tifs_clear() atomically resets after the 2 s
+ * post-FSU settle so only post-settle transitions aggregate. The drain
+ * snapshots under irq_lock() then formats after unlock. The FIRST record
+ * after a fresh connection is skipped (tifs_prog_prev starts stale=150). */
 #define TIFS_NBINS   4U
-#define TIFS_NHIST   9U          /* buckets of 20 us: [0,20)...[160,inf) */
+#define TIFS_NHIST   256U        /* exact 1 us bins: CC0 value 0..255 */
 struct tifs_bin {
 	uint16_t tifs;               /* programmed spacing that produced CC0 */
 	uint8_t  phy;
 	uint8_t  used;
 	uint32_t n_total;
 	uint32_t n_valid;            /* fresh CRC-valid RX preceded */
-	uint16_t cc0_min, cc0_max;   /* over valid records */
-	uint32_t hist[TIFS_NHIST];   /* CC0 histogram over valid records */
+	uint32_t hist[TIFS_NHIST];   /* exact-us CC0 histogram over valid */
 };
 static struct tifs_bin tifs_bins[TIFS_NBINS];
 static uint8_t  tifs_fresh;      /* set in isr_rx on CRC-valid RX */
-static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150 at start */
-static uint32_t tifs_dropped;    /* records that found no free bin */
+static uint8_t  tifs_prime;      /* skip the first transition after connect */
+static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150, stale at start */
+static uint32_t tifs_dropped;    /* no free bin, or CC0 out of 0..255 range */
 
 static inline void tifs_on_rx_crc_ok(void)
 {
@@ -142,14 +146,22 @@ static inline void tifs_on_rx_crc_ok(void)
 static inline void tifs_on_tx(struct lll_conn *lll)
 {
 	uint32_t cc0 = radio_tmr_ready_get();
-	uint16_t cc = (cc0 > 60000U) ? 0xFFFFU : (uint16_t)cc0;
-	uint16_t tifs = tifs_prog_prev;   /* the value that PRODUCED this CC0 */
+	uint16_t tifs = tifs_prog_prev;   /* value that PRODUCED this CC0 */
 #if defined(CONFIG_BT_CTLR_PHY)
 	uint8_t phy = lll->phy_tx;
 #else
 	uint8_t phy = 1U;
 #endif
 	struct tifs_bin *b = NULL;
+
+	/* Skip the first paired transition after a (re)connection: at that
+	 * point tifs_prog_prev is stale (init 150 / previous connection). */
+	if (tifs_prime) {
+		tifs_prime = 0U;
+		tifs_prog_prev = lll->tifs_tx_us;
+		tifs_fresh = 0U;
+		return;
+	}
 
 	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
 		if (tifs_bins[i].used && tifs_bins[i].tifs == tifs &&
@@ -161,63 +173,80 @@ static inline void tifs_on_tx(struct lll_conn *lll)
 			b = &tifs_bins[i];
 		}
 	}
-	if (b == NULL) {
+	if (b == NULL || cc0 > (TIFS_NHIST - 1U)) {
 		tifs_dropped++;
 	} else {
 		if (!b->used) {
 			b->used = 1U;
 			b->tifs = tifs;
 			b->phy = phy;
-			b->cc0_min = 0xFFFFU;
 		}
 		b->n_total++;
 		if (tifs_fresh) {
-			uint32_t h = cc / 20U;
-
-			if (h >= TIFS_NHIST) {
-				h = TIFS_NHIST - 1U;
-			}
-			b->hist[h]++;
+			b->hist[cc0]++;
 			b->n_valid++;
-			if (cc < b->cc0_min) {
-				b->cc0_min = cc;
-			}
-			if (cc > b->cc0_max) {
-				b->cc0_max = cc;
-			}
 		}
 	}
 
-	/* latch the value isr_tx is about to program (line below) for the
-	 * NEXT event's CC0. */
-	tifs_prog_prev = lll->tifs_tx_us;
+	tifs_prog_prev = lll->tifs_tx_us;   /* programs the NEXT switch */
 	tifs_fresh = 0U;
 }
 
-/* Drained + formatted from thread ctx (app printk's the buffer). Emits one
- * line per active bin: programmed tifs, phy, totals, valid CC0 min/max, and
- * the histogram (median derivable); plus a global dropped counter. Bins are
- * left in place (cumulative) so a late-connecting reader still sees them. */
+/* Atomically clear all bins + counters. App calls this AFTER the 2 s
+ * post-FSU settle so only post-settle transitions aggregate; also prime the
+ * first-transition skip. */
+void bt_ctlr_tifs_clear(void);
+void bt_ctlr_tifs_clear(void)
+{
+	unsigned int key = irq_lock();
+
+	(void)memset(tifs_bins, 0, sizeof(tifs_bins));
+	tifs_dropped = 0U;
+	tifs_prime = 1U;
+	irq_unlock(key);
+}
+
+/* Snapshot under irq_lock(), format after unlock. Emits per active bin:
+ * programmed tifs, phy, totals, exact CC0 min/median/max, and drop count.
+ * drop MUST be 0 for acceptance. */
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen);
 uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 {
+	static struct tifs_bin snap[TIFS_NBINS];
+	uint32_t drop;
 	uint32_t used = 0U;
+	unsigned int key = irq_lock();
+
+	(void)memcpy(snap, tifs_bins, sizeof(snap));
+	drop = tifs_dropped;
+	irq_unlock(key);
 
 	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
-		struct tifs_bin *b = &tifs_bins[i];
+		struct tifs_bin *b = &snap[i];
+		uint32_t cum = 0U, mn = 0xFFFFU, mx = 0U, med = 0U;
 		int w;
 
-		if (!b->used || (buflen - used) < 140U) {
+		if (!b->used || b->n_valid == 0U || (buflen - used) < 96U) {
 			continue;
 		}
+		for (uint32_t v = 0U; v < TIFS_NHIST; v++) {
+			if (b->hist[v] == 0U) {
+				continue;
+			}
+			if (v < mn) {
+				mn = v;
+			}
+			mx = v;
+			cum += b->hist[v];
+			if (med == 0U && (cum * 2U) >= b->n_valid) {
+				med = v;
+			}
+		}
 		w = snprintf(&buf[used], buflen - used,
-			     "TIFSBIN tifs=%u phy=%u n=%u nv=%u min=%u max=%u "
-			     "hist=%u,%u,%u,%u,%u,%u,%u,%u,%u drop=%u\n",
+			     "TIFSBIN tifs=%u phy=%u n=%u nv=%u min=%u med=%u "
+			     "max=%u drop=%u\n",
 			     b->tifs, b->phy, b->n_total, b->n_valid,
-			     b->cc0_min, b->cc0_max,
-			     b->hist[0], b->hist[1], b->hist[2], b->hist[3],
-			     b->hist[4], b->hist[5], b->hist[6], b->hist[7],
-			     b->hist[8], tifs_dropped);
+			     mn, med, mx, drop);
 		if (w > 0) {
 			used += (uint32_t)w;
 		}
