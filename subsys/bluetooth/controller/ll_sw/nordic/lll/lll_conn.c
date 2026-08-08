@@ -100,6 +100,75 @@ static uint8_t crc_valid;
 static uint8_t is_aborted;
 static uint16_t tx_cnt;
 static uint16_t trx_cnt;
+
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+#include <stdio.h>
+/* §6.1 BENCH-ONLY (M0): read the controller's SHARED EVENT_TIMER CC0 at the
+ * start of lll_conn_isr_tx. With SW_SWITCH_SINGLE_TIMER the RX PHYEND clears
+ * the timebase, so CC0 (radio_tmr_ready_get()) IS the RX-PHYEND->TX-READY
+ * interval (a hardware-event timing PROXY, stops before the on-air TX bit;
+ * NOT on-air). No printing in the ISR: fixed-size records to a static ring,
+ * drained from thread context. Freshness-gated on a CRC-valid RX. */
+struct tifs_rec {
+	uint16_t cc0_us;      /* RX-PHYEND -> TX-READY interval */
+	uint16_t tifs_tx_us;  /* configured spacing this event */
+	uint8_t  phy;         /* lll->phy_tx */
+	uint8_t  valid;       /* fresh CRC-valid RX preceded */
+	uint32_t seq;         /* event sequence for pairing audit */
+};
+#define TIFS_RING_N 256U
+static struct tifs_rec tifs_ring[TIFS_RING_N];
+static volatile uint32_t tifs_head;   /* ISR writes */
+static uint32_t tifs_tail;            /* thread drains */
+static uint8_t tifs_fresh;            /* set in isr_rx on CRC-valid RX */
+static uint32_t tifs_seq;
+
+static inline void tifs_on_rx_crc_ok(void)
+{
+	tifs_fresh = 1U;
+}
+
+static inline void tifs_on_tx(struct lll_conn *lll)
+{
+	uint32_t cc0 = radio_tmr_ready_get();
+	struct tifs_rec *r = &tifs_ring[tifs_head & (TIFS_RING_N - 1U)];
+
+	r->cc0_us = (cc0 > 60000U) ? 0xFFFFU : (uint16_t)cc0;
+	r->tifs_tx_us = lll->tifs_tx_us;
+#if defined(CONFIG_BT_CTLR_PHY)
+	r->phy = lll->phy_tx;
+#else
+	r->phy = 1U;
+#endif
+	r->valid = tifs_fresh;   /* only fresh CRC-valid RX -> TX turnarounds count */
+	r->seq = tifs_seq++;
+	tifs_head++;
+	tifs_fresh = 0U;
+}
+
+/* Drained + formatted from thread/ULL context (app calls this and printk's
+ * the buffer). Keeps the record struct private to the controller. Emits one
+ * compact line per record; returns bytes written. */
+uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen);
+uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
+{
+	uint32_t used = 0U;
+
+	while (tifs_tail != tifs_head && (buflen - used) > 64U) {
+		struct tifs_rec *r = &tifs_ring[tifs_tail & (TIFS_RING_N - 1U)];
+		int w = snprintf(&buf[used], buflen - used,
+				 "TIFS cc0=%u tifs=%u phy=%u v=%u seq=%u\n",
+				 r->cc0_us, r->tifs_tx_us, r->phy, r->valid,
+				 r->seq);
+		if (w <= 0) {
+			break;
+		}
+		used += (uint32_t)w;
+		tifs_tail++;
+	}
+	return used;
+}
+#endif /* CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH */
 static uint8_t trx_busy_iteration;
 
 #if defined(CONFIG_BT_CTLR_LE_ENC)
@@ -430,6 +499,9 @@ void lll_conn_isr_rx(void *param)
 	if (crc_ok) {
 		uint32_t err;
 
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+		tifs_on_rx_crc_ok();
+#endif
 		err = isr_rx_pdu(lll, pdu_data_rx, &is_rx_enqueue, &tx_release,
 				 &is_done);
 		if (err) {
@@ -753,6 +825,13 @@ void lll_conn_isr_tx(void *param)
 	tx_cnt++;
 
 	lll = param;
+
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+	/* CC0 here = the preceding RX-PHYEND -> TX-READY interval (single-timer
+	 * base was cleared at RX PHYEND). Read BEFORE anything reprograms the
+	 * timer for the next tIFS. */
+	tifs_on_tx(lll);
+#endif
 
 	/* setup tIFS switching */
 	radio_tmr_tifs_set(lll->tifs_tx_us);
