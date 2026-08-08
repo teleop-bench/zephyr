@@ -1517,3 +1517,13 @@ config BT_CTLR_FSU_BENCH_FORCE_FEAT
 	  peer answers LL_FRAME_SPACE_REQ with LL_UNKNOWN_RSP, which this
 	  implementation handles as clean procedure termination. Never
 	  enable outside the open<->open bench rig.
+
+config BT_CTLR_TIFS_CAPTURE_BENCH
+	bool "BENCH-ONLY: capture RX-PHYEND->TX-READY interval via EVENT_TIMER CC0"
+	help
+	  M0 §6.1 physical-timing PROXY. Reads the controller's shared
+	  EVENT_TIMER CC0 (radio_tmr_ready_get) at the start of
+	  lll_conn_isr_tx = the RX-PHYEND->TX-READY turnaround interval
+	  (single-timer mode). Records to a static ring, drained/printed from
+	  thread context via bt_ctlr_tifs_drain_fmt(). NOT on-air; not for
+	  production.
