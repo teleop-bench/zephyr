@@ -180,6 +180,10 @@ static int prepare_cb(struct lll_prepare_param *p)
 	radio_aa_set(lll->access_addr);
 	radio_crc_configure(PDU_CRC_POLYNOMIAL,
 					sys_get_le24(lll->crc_init));
+	{ extern volatile uint32_t lll_conn_q2_evt[40];
+	  extern volatile uint8_t lll_conn_q2_curchan;
+	  lll_conn_q2_curchan = data_chan_use;
+	  if (data_chan_use < 40U) lll_conn_q2_evt[data_chan_use]++; }
 	lll_chan_set(data_chan_use);
 
 	lll_conn_tx_pkt_set(lll, pdu_data_tx);

@@ -34,6 +34,17 @@
 #include "lll_df.h"
 #include "lll_conn.h"
 
+/* Q2 diagnostic (zephyr-patches/q2-print-conn-params.patch): per-data-channel
+ * per-channel DENOMINATOR counter, ROLE-DEPENDENT meaning: central = actual TX
+ * completion (isr_tx); peripheral = CRC-good response-opportunity (isr_rx). Per
+ * channel. The app prints it so the observer has a NON-circular retention
+ * denominator (events the observer never saw still count here). */
+volatile uint32_t lll_conn_q2_evt[40];   /* SCHEDULED opportunities/chan */
+volatile uint32_t lll_conn_q2_tx[40];    /* ACTUAL TX-completed pkts/chan */
+volatile uint32_t lll_conn_q2_session;   /* controller-owned, ++ per connect setup */
+volatile uint32_t lll_conn_q2_aa;        /* connection AA = shared id (both roles) */
+volatile uint8_t  lll_conn_q2_curchan = 255; /* ACTUAL remapped chan this event */
+
 #include "lll_internal.h"
 #include "lll_df_internal.h"
 #include "lll_tim_internal.h"
@@ -597,6 +608,16 @@ void lll_conn_isr_rx(void *param)
 
 	trx_cnt++;
 
+	/* Q2: PERIPHERAL response-opportunity counter (a CONSERVATIVE periph-TX
+	 * denominator, per review). Counted only on a CRC-GOOD reception -- the
+	 * peripheral then transmits its response, so this is >= its actual TX
+	 * (a rare post-CRC abort would not transmit). CENTRAL actual TX is counted
+	 * in lll_conn_isr_tx. crc_ok is already computed above. */
+	{ extern volatile uint32_t lll_conn_q2_tx[40];
+	  extern volatile uint8_t lll_conn_q2_curchan;
+	  struct lll_conn *ql = param;   /* 'lll' is not yet assigned here */
+	  if (ql->role && crc_ok && (lll_conn_q2_curchan < 40U)) lll_conn_q2_tx[lll_conn_q2_curchan]++; }
+
 	is_done = 0U;
 	tx_release = NULL;
 	is_rx_enqueue = 0U;
@@ -937,6 +958,9 @@ void lll_conn_isr_tx(void *param)
 	tx_cnt++;
 
 	lll = param;
+	{ extern volatile uint32_t lll_conn_q2_tx[40];
+	  extern volatile uint8_t lll_conn_q2_curchan;
+	  if (lll_conn_q2_curchan < 40U) lll_conn_q2_tx[lll_conn_q2_curchan]++; }
 
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
 	/* CC0 here = the preceding RX-PHYEND -> TX-READY interval (single-timer
