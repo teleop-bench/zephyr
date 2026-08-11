@@ -250,6 +250,25 @@ uint8_t ll_create_connection(uint16_t scan_interval, uint16_t scan_window,
 	conn_lll->data_chan_hop = 5 + (hop % 12);
 	conn_lll->data_chan_sel = 0;
 	conn_lll->data_chan_use = 0;
+	/* Q2 DIAGNOSTIC (zephyr-patches/q2-print-conn-params.patch): expose the
+	 * central-minted connection AA + CRCInit so a passive raw-radio observer
+	 * can be tuned to them. AA=LE32(access_addr), CRCINIT=LE24(crc_init) --
+	 * exactly what the observer's RADIO BASE0/PREFIX0 and CRCINIT expect. */
+	{ extern volatile uint32_t lll_conn_q2_aa, lll_conn_q2_session;
+	  lll_conn_q2_aa = (uint32_t)conn_lll->access_addr[0] |
+	    ((uint32_t)conn_lll->access_addr[1] << 8) |
+	    ((uint32_t)conn_lll->access_addr[2] << 16) |
+	    ((uint32_t)conn_lll->access_addr[3] << 24);
+	  lll_conn_q2_session++; }
+	printk("Q2CONN AA=%02x%02x%02x%02x CRCINIT=%02x%02x%02x hop=%u chan_count=%u "
+	       "map=%02x%02x%02x%02x%02x\n",
+	       conn_lll->access_addr[3], conn_lll->access_addr[2],
+	       conn_lll->access_addr[1], conn_lll->access_addr[0],
+	       conn_lll->crc_init[2], conn_lll->crc_init[1], conn_lll->crc_init[0],
+	       conn_lll->data_chan_hop, conn_lll->data_chan_count,
+	       conn_lll->data_chan_map[0], conn_lll->data_chan_map[1],
+	       conn_lll->data_chan_map[2], conn_lll->data_chan_map[3],
+	       conn_lll->data_chan_map[4]);
 	conn_lll->role = 0;
 	conn_lll->central.initiated = 0;
 	conn_lll->central.cancelled = 0;

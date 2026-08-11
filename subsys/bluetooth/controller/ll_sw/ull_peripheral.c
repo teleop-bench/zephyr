@@ -151,6 +151,12 @@ void ull_periph_setup(struct node_rx_pdu *rx, struct node_rx_ftr *ftr,
 
 	memcpy(&lll->crc_init[0], &pdu_adv->connect_ind.crc_init[0], 3);
 	memcpy(&lll->access_addr[0], &pdu_adv->connect_ind.access_addr[0], 4);
+	{ extern volatile uint32_t lll_conn_q2_aa, lll_conn_q2_session;
+	  lll_conn_q2_aa = (uint32_t)lll->access_addr[0] |
+	    ((uint32_t)lll->access_addr[1] << 8) |
+	    ((uint32_t)lll->access_addr[2] << 16) |
+	    ((uint32_t)lll->access_addr[3] << 24);
+	  lll_conn_q2_session++; }
 	memcpy(&lll->data_chan_map[0], &pdu_adv->connect_ind.chan_map[0],
 	       sizeof(lll->data_chan_map));
 	lll->data_chan_count = util_ones_count_get(&lll->data_chan_map[0],
