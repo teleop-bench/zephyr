@@ -115,24 +115,27 @@ static uint16_t trx_cnt;
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
 #include <stdio.h>
 #include <zephyr/irq.h>
-/* §6.1 BENCH-ONLY (M0), rev 3. Read the controller's SHARED EVENT_TIMER CC0
- * at the start of lll_conn_isr_tx. With SW_SWITCH_SINGLE_TIMER the RX PHYEND
- * clears the timebase, so CC0 (radio_tmr_ready_get()) IS the RX-PHYEND->
- * TX-READY interval of the switch that JUST completed (a hardware-event
- * timing PROXY, stops before the on-air TX bit; NOT on-air).
+/* §6.1 BENCH-ONLY (M0), rev 6. Read the controller's SHARED EVENT_TIMER CC0
+ * (radio_tmr_ready_get()) = the RX-PHYEND -> TX-READY interval of the switch
+ * that just completed (a hardware-event timing PROXY, stops before the on-air
+ * TX bit; NOT on-air), with SW_SWITCH_SINGLE_TIMER clearing the timebase at RX
+ * PHYEND.
  *
- * PAIRING: CC0 is the switch that just completed; lll->tifs_tx_us read in
- * isr_tx programs the NEXT switch. The tifs that PRODUCED this CC0 is the
- * one latched at the PREVIOUS isr_tx -> `tifs_prog_prev`.
+ * PAIRING (rev 6, PENDING-SAMPLE LATCH -- replaces the rev<=5 previous-ISR
+ * `tifs_prog_prev`, which under-sampled the peripheral): the tifs/phy are
+ * LATCHED (bt_ctlr_tifs_latch) at the moment the RX->TX switch is PROGRAMMED --
+ * peripheral prepare for the first switch, isr_tx for continuing switches. A
+ * CRC-good RX ARMS exactly one pending sample; it is CONSUMED once at whichever
+ * TX-completion route runs -- isr_tx (continuing) OR isr_done (final one-pair
+ * peripheral response) -- labelled with the LATCHED tifs (not the current
+ * lll->tifs_tx_us, which may already have moved across the FSU transition).
  *
- * AGGREGATION (rev 3): EXACT 1 us bins (CC0 0..255) so the preregistered
- * MEDIAN is exact at ~1 us resolution. Per (tifs, phy) bin. BOUNDED with
- * EXPLICIT LOSS ACCOUNTING (not "lossless"): a record with no free bin (all
- * TIFS_NBINS occupied) or CC0>255 increments a drop counter; acceptance
- * REQUIRES drop=0. bt_ctlr_tifs_clear() atomically resets after the 2 s
- * post-FSU settle so only post-settle transitions aggregate. The drain
- * snapshots under irq_lock() then formats after unlock. The FIRST record
- * after a fresh connection is skipped (tifs_prog_prev starts stale=150). */
+ * AGGREGATION: EXACT 1 us bins (CC0 0..255) -> exact preregistered MEDIAN. Per
+ * (tifs, phy) bin. BOUNDED with EXPLICIT LOSS ACCOUNTING: no free bin or CC0>255
+ * increments a drop counter; acceptance REQUIRES drop=0. bt_ctlr_tifs_clear()
+ * atomically resets after the post-FSU settle. The drain snapshots under
+ * irq_lock() then formats after unlock, and emits a TIFSDIAG reconciliation line
+ * (prog/arm/cons_tx/cons_done/stale_done/dup/drop). */
 #define TIFS_NBINS   4U
 #define TIFS_NHIST   256U        /* exact 1 us bins: CC0 value 0..255 */
 struct tifs_bin {
@@ -144,67 +147,86 @@ struct tifs_bin {
 	uint32_t hist[TIFS_NHIST];   /* exact-us CC0 histogram over valid */
 };
 static struct tifs_bin tifs_bins[TIFS_NBINS];
-static uint8_t  tifs_fresh;      /* set in isr_rx on CRC-valid RX */
-static uint8_t  tifs_prime;      /* skip the first post-clear transition */
 static uint8_t  tifs_capturing;  /* 1 = aggregate; 0 = frozen (drain-safe) */
-static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150, stale at start */
 static uint32_t tifs_dropped;    /* no free bin, or CC0 out of 0..255 range */
-/* DIAGNOSTIC (rev 5): reconcile capture ATTEMPTS vs opportunities. NO timing-source or
- * hook-placement change (the CC0 read is untouched) -- but it DOES add counter writes
- * in the radio ISR, i.e. minor additional instrumentation with possible perturbation.
- * tifs_calls = tifs_on_tx entries while capturing; tifs_fresh_calls = those with a
- * CRC-good RX latched; tifs_role = last caller's role (0xFF = no call this run). A
- * near-zero tifs_calls => the hook is on the wrong path for this role (isr_tx installed
- * only when is_done==false; a normal one-pair event finishes through isr_done); a high
- * tifs_calls with low n_valid => a gating (fresh/prime/cc0-range) issue. */
-static uint32_t tifs_calls, tifs_fresh_calls;
-static uint8_t  tifs_role = 0xFFU;   /* sentinel: no tifs_on_tx call yet */
+/* rev 6: PENDING-SAMPLE LATCH model (replaces the previous-ISR tifs_prog_prev, whose
+ * model did not describe the normal peripheral event whose FIRST RX->TX switch is
+ * programmed during peripheral prepare). The peripheral's normal one-pair response TX
+ * completes via isr_done, NOT isr_tx, so the old scheme under-sampled it (smoke-2:
+ * calls=2). Now: LATCH the programmed tifs/phy WHEN the RX->TX switch is configured
+ * (bt_ctlr_tifs_latch); ARM exactly one pending sample on a CRC-good RX (never on CRC
+ * fail / abort / no-RX); CONSUME it exactly once at whichever completion route runs
+ * (isr_tx continuing OR isr_done final), labelled with the LATCHED tifs -- never the
+ * current lll->tifs_tx_us, which may have changed after that switch was programmed
+ * (e.g. across the FSU transition), which would misassign the sample to a plateau. */
+static uint16_t tifs_lat_tifs = EVENT_IFS_DEFAULT_US;  /* tifs latched at switch-program */
+static uint8_t  tifs_lat_phy = 1U;
+static uint32_t tifs_lat_gen;    /* ++ per switch programmed */
+static uint8_t  tifs_armed;      /* CRC-good RX -> one response-transition sample pending */
+static uint32_t tifs_cons_gen;   /* gen of the last consumed sample (duplicate guard) */
+/* diagnostics (drained as TIFSDIAG; smoke-3 reconciliation) */
+static uint32_t tifs_prog_cnt, tifs_arm_cnt, tifs_cons_tx, tifs_cons_done,
+		tifs_stale_done, tifs_dup_cnt;
 
-static inline void tifs_on_rx_crc_ok(void)
+/* Latch the tifs/phy that will PRODUCE the next CC0, at the moment the RX->TX switch is
+ * programmed (peripheral prepare for the first switch; isr_tx for continuing switches).
+ * Exported: also called from lll_peripheral.c. */
+void bt_ctlr_tifs_latch(uint16_t tifs_tx_us, uint8_t phy);
+void bt_ctlr_tifs_latch(uint16_t tifs_tx_us, uint8_t phy)
 {
-	tifs_fresh = 1U;
+	tifs_lat_tifs = tifs_tx_us;
+	tifs_lat_phy = phy ? phy : 1U;
+	tifs_lat_gen++;
+	if (tifs_capturing) {
+		tifs_prog_cnt++;
+	}
 }
 
-static inline void tifs_on_tx(struct lll_conn *lll)
+/* CRC-good RX successfully processed -> a response transition is expected. Arm exactly
+ * one pending sample (idempotent within an event). */
+static inline void tifs_on_rx_crc_ok(void)
 {
-	uint32_t cc0 = radio_tmr_ready_get();
-	uint16_t tifs = tifs_prog_prev;   /* value that PRODUCED this CC0 */
-	if (tifs_capturing) {
-		tifs_calls++;
-		tifs_role = lll->role;
-		if (tifs_fresh) {
-			tifs_fresh_calls++;
-		}
+	if (tifs_capturing && !tifs_armed) {
+		tifs_armed = 1U;
+		tifs_arm_cnt++;
 	}
-#if defined(CONFIG_BT_CTLR_PHY)
-	uint8_t phy = lll->phy_tx;
-#else
-	uint8_t phy = 1U;
-#endif
+}
+
+/* Consume the pending response-transition sample once, at TX completion. via_done=1 at
+ * the isr_done route (final one-pair peripheral response), 0 at isr_tx (continuing). */
+static inline void tifs_consume(uint8_t via_done)
+{
+	uint32_t cc0;
 	struct tifs_bin *b = NULL;
 
-	/* Frozen (drain in progress or run ended): keep the pairing latch
-	 * current but do not touch the bins the thread is reading. */
 	if (!tifs_capturing) {
-		tifs_prog_prev = lll->tifs_tx_us;
-		tifs_fresh = 0U;
 		return;
 	}
-
-	/* Skip the FIRST post-clear transition: tifs_prog_prev is stale
-	 * (from before the clear / a previous connection). NOTE: primed only
-	 * by bt_ctlr_tifs_clear(); runs are reset-isolated (one connection),
-	 * and a mid-run reconnect is rejected at analysis (disc must be 0). */
-	if (tifs_prime) {
-		tifs_prime = 0U;
-		tifs_prog_prev = lll->tifs_tx_us;
-		tifs_fresh = 0U;
+	if (!tifs_armed) {
+		/* no pending response at this completion: an unrelated/no-response
+		 * completion, OR a second visit for a sample already consumed. Never
+		 * infer validity merely from entering isr_done. */
+		if (via_done) {
+			if (tifs_lat_gen == tifs_cons_gen) {
+				tifs_dup_cnt++;      /* this gen already consumed elsewhere */
+			} else {
+				tifs_stale_done++;   /* isr_done with no armed response */
+			}
+		}
 		return;
 	}
-
+	/* exactly one pending sample -> read CC0 BEFORE any status reset, clear the arm */
+	cc0 = radio_tmr_ready_get();
+	tifs_armed = 0U;
+	tifs_cons_gen = tifs_lat_gen;
+	if (via_done) {
+		tifs_cons_done++;
+	} else {
+		tifs_cons_tx++;
+	}
 	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
-		if (tifs_bins[i].used && tifs_bins[i].tifs == tifs &&
-		    tifs_bins[i].phy == phy) {
+		if (tifs_bins[i].used && tifs_bins[i].tifs == tifs_lat_tifs &&
+		    tifs_bins[i].phy == tifs_lat_phy) {
 			b = &tifs_bins[i];
 			break;
 		}
@@ -214,21 +236,16 @@ static inline void tifs_on_tx(struct lll_conn *lll)
 	}
 	if (b == NULL || cc0 > (TIFS_NHIST - 1U)) {
 		tifs_dropped++;
-	} else {
-		if (!b->used) {
-			b->used = 1U;
-			b->tifs = tifs;
-			b->phy = phy;
-		}
-		b->n_total++;
-		if (tifs_fresh) {
-			b->hist[cc0]++;
-			b->n_valid++;
-		}
+		return;
 	}
-
-	tifs_prog_prev = lll->tifs_tx_us;   /* programs the NEXT switch */
-	tifs_fresh = 0U;
+	if (!b->used) {
+		b->used = 1U;
+		b->tifs = tifs_lat_tifs;
+		b->phy = tifs_lat_phy;
+	}
+	b->n_total++;
+	b->hist[cc0]++;
+	b->n_valid++;   /* == n_total: arm only fires on a CRC-good RX */
 }
 
 /* Start/restart capture after the post-FSU settle so only post-settle
@@ -245,12 +262,13 @@ void bt_ctlr_tifs_clear(void)
 
 	(void)memset(tifs_bins, 0, sizeof(tifs_bins));   /* outside lock */
 	tifs_dropped = 0U;
-	tifs_calls = 0U;
-	tifs_fresh_calls = 0U;
-	tifs_role = 0xFFU;   /* sentinel so calls=0 never reports a stale/default role */
+	tifs_prog_cnt = tifs_arm_cnt = tifs_cons_tx = tifs_cons_done = 0U;
+	tifs_stale_done = tifs_dup_cnt = 0U;
 
 	key = irq_lock();
-	tifs_prime = 1U;
+	tifs_armed = 0U;     /* drop any pre-clear pending sample */
+	tifs_lat_gen = 0U;
+	tifs_cons_gen = 0U;
 	tifs_capturing = 1U;             /* enable (tiny) */
 	irq_unlock(key);
 }
@@ -309,12 +327,14 @@ uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 			used += (uint32_t)w;
 		}
 	}
-	/* diagnostic reconciliation line (analyzer ignores it): how many times the hook
-	 * ran vs how many had a fresh CRC-good RX, and the last caller's role. */
-	if ((buflen - used) >= 64U) {
+	/* diagnostic reconciliation line (analyzer ignores it): switches programmed,
+	 * responses armed, consumes per route, stale/duplicate isr_done, drops. */
+	if ((buflen - used) >= 96U) {
 		int w = snprintf(&buf[used], buflen - used,
-				 "TIFSDIAG calls=%u fresh=%u drop=%u role=%u\n",
-				 tifs_calls, tifs_fresh_calls, drop, tifs_role);
+				 "TIFSDIAG prog=%u arm=%u cons_tx=%u cons_done=%u "
+				 "stale_done=%u dup=%u drop=%u\n",
+				 tifs_prog_cnt, tifs_arm_cnt, tifs_cons_tx, tifs_cons_done,
+				 tifs_stale_done, tifs_dup_cnt, drop);
 		if (w > 0) {
 			used += (uint32_t)w;
 		}
@@ -993,14 +1013,23 @@ void lll_conn_isr_tx(void *param)
 	  if (lll_conn_q2_curchan < 40U) lll_conn_q2_tx[lll_conn_q2_curchan]++; }
 
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
-	/* CC0 here = the preceding RX-PHYEND -> TX-READY interval (single-timer
-	 * base was cleared at RX PHYEND). Read BEFORE anything reprograms the
-	 * timer for the next tIFS. */
-	tifs_on_tx(lll);
+	/* CONSUME the pending sample for the switch that just completed (CC0 here =
+	 * the preceding RX-PHYEND -> TX-READY interval; read BEFORE the reprogram
+	 * below). This is the CONTINUING-exchange route. */
+	tifs_consume(0U);
 #endif
 
 	/* setup tIFS switching */
 	radio_tmr_tifs_set(lll->tifs_tx_us);
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+	/* LATCH the tifs/phy just programmed for the NEXT switch. */
+	bt_ctlr_tifs_latch(lll->tifs_tx_us,
+#if defined(CONFIG_BT_CTLR_PHY)
+			   lll->phy_tx);
+#else
+			   1U);
+#endif
+#endif
 
 #if defined(CONFIG_BT_CTLR_DF_CONN_CTE_RX)
 #if defined(CONFIG_BT_CTLR_DF_PHYEND_OFFSET_COMPENSATION_ENABLE)
@@ -1392,6 +1421,13 @@ static int init_reset(void)
 static void isr_done(void *param)
 {
 	struct event_done_extra *e;
+
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+	/* CONSUME the pending sample at the FINAL one-pair-response route -- BEFORE the
+	 * status reset clears the radio timer. Only fires if a CRC-good RX armed one this
+	 * event (never inferred merely from reaching isr_done). */
+	tifs_consume(1U);
+#endif
 
 	lll_isr_status_reset();
 

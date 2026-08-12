@@ -217,6 +217,17 @@ static int prepare_cb(struct lll_prepare_param *p)
 	radio_isr_set(lll_conn_isr_rx, lll);
 
 	radio_tmr_tifs_set(lll->tifs_tx_us);
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+	/* rev 6: LATCH the tifs/phy of the peripheral's FIRST RX->TX switch of this event,
+	 * programmed HERE during prepare (the case the old previous-ISR scheme missed). */
+	{ extern void bt_ctlr_tifs_latch(uint16_t tifs_tx_us, uint8_t phy);
+	  bt_ctlr_tifs_latch(lll->tifs_tx_us,
+#if defined(CONFIG_BT_CTLR_PHY)
+			     lll->phy_tx); }
+#else
+			     1U); }
+#endif
+#endif /* CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH */
 
 #if defined(CONFIG_BT_CTLR_DF_CONN_CTE_RX)
 #if defined(CONFIG_BT_CTLR_DF_PHYEND_OFFSET_COMPENSATION_ENABLE)
