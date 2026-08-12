@@ -149,6 +149,16 @@ static uint8_t  tifs_prime;      /* skip the first post-clear transition */
 static uint8_t  tifs_capturing;  /* 1 = aggregate; 0 = frozen (drain-safe) */
 static uint16_t tifs_prog_prev = EVENT_IFS_DEFAULT_US;  /* 150, stale at start */
 static uint32_t tifs_dropped;    /* no free bin, or CC0 out of 0..255 range */
+/* DIAGNOSTIC (rev 5): reconcile capture ATTEMPTS vs opportunities. NO timing-source or
+ * hook-placement change (the CC0 read is untouched) -- but it DOES add counter writes
+ * in the radio ISR, i.e. minor additional instrumentation with possible perturbation.
+ * tifs_calls = tifs_on_tx entries while capturing; tifs_fresh_calls = those with a
+ * CRC-good RX latched; tifs_role = last caller's role (0xFF = no call this run). A
+ * near-zero tifs_calls => the hook is on the wrong path for this role (isr_tx installed
+ * only when is_done==false; a normal one-pair event finishes through isr_done); a high
+ * tifs_calls with low n_valid => a gating (fresh/prime/cc0-range) issue. */
+static uint32_t tifs_calls, tifs_fresh_calls;
+static uint8_t  tifs_role = 0xFFU;   /* sentinel: no tifs_on_tx call yet */
 
 static inline void tifs_on_rx_crc_ok(void)
 {
@@ -159,6 +169,13 @@ static inline void tifs_on_tx(struct lll_conn *lll)
 {
 	uint32_t cc0 = radio_tmr_ready_get();
 	uint16_t tifs = tifs_prog_prev;   /* value that PRODUCED this CC0 */
+	if (tifs_capturing) {
+		tifs_calls++;
+		tifs_role = lll->role;
+		if (tifs_fresh) {
+			tifs_fresh_calls++;
+		}
+	}
 #if defined(CONFIG_BT_CTLR_PHY)
 	uint8_t phy = lll->phy_tx;
 #else
@@ -228,6 +245,9 @@ void bt_ctlr_tifs_clear(void)
 
 	(void)memset(tifs_bins, 0, sizeof(tifs_bins));   /* outside lock */
 	tifs_dropped = 0U;
+	tifs_calls = 0U;
+	tifs_fresh_calls = 0U;
+	tifs_role = 0xFFU;   /* sentinel so calls=0 never reports a stale/default role */
 
 	key = irq_lock();
 	tifs_prime = 1U;
@@ -285,6 +305,16 @@ uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 			     "max=%u drop=%u\n",
 			     b->tifs, b->phy, b->n_total, b->n_valid,
 			     mn, med, mx, drop);
+		if (w > 0) {
+			used += (uint32_t)w;
+		}
+	}
+	/* diagnostic reconciliation line (analyzer ignores it): how many times the hook
+	 * ran vs how many had a fresh CRC-good RX, and the last caller's role. */
+	if ((buflen - used) >= 64U) {
+		int w = snprintf(&buf[used], buflen - used,
+				 "TIFSDIAG calls=%u fresh=%u drop=%u role=%u\n",
+				 tifs_calls, tifs_fresh_calls, drop, tifs_role);
 		if (w > 0) {
 			used += (uint32_t)w;
 		}
