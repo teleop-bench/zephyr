@@ -115,11 +115,17 @@ static uint16_t trx_cnt;
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
 #include <stdio.h>
 #include <zephyr/irq.h>
-/* §6.1 BENCH-ONLY (M0), rev 6. Read the controller's SHARED EVENT_TIMER CC0
+/* §6.1 BENCH-ONLY (M0), rev 7. Read the controller's SHARED EVENT_TIMER CC0
  * (radio_tmr_ready_get()) = the RX-PHYEND -> TX-READY interval of the switch
  * that just completed (a hardware-event timing PROXY, stops before the on-air
  * TX bit; NOT on-air), with SW_SWITCH_SINGLE_TIMER clearing the timebase at RX
  * PHYEND.
+ *
+ * READY RE-ARM (rev 7): the READY->CC0 capture PPI is armed at event start (RX
+ * READY) and DISABLED by lll_isr_rx_status_reset() before the response TX, so
+ * CC0 would hold the STALE event-start RX READY. The peripheral RX ISR re-arms
+ * ONLY that capture (bt_ctlr_tifs_rearm_ready_capture(), radio.c) after the
+ * status reset, so CC0 reflects the RESPONSE-TX READY.
  *
  * PAIRING (rev 6, PENDING-SAMPLE LATCH -- replaces the rev<=5 previous-ISR
  * `tifs_prog_prev`, which under-sampled the peripheral): the tifs/phy are
@@ -164,9 +170,10 @@ static uint8_t  tifs_lat_phy = 1U;
 static uint32_t tifs_lat_gen;    /* ++ per switch programmed */
 static uint8_t  tifs_armed;      /* CRC-good RX -> one response-transition sample pending */
 static uint32_t tifs_cons_gen;   /* gen of the last consumed sample (duplicate guard) */
-/* diagnostics (drained as TIFSDIAG; smoke-3 reconciliation) */
+static uint8_t  tifs_rearmed;    /* rev 7: READY capture re-armed for THIS response TX */
+/* diagnostics (drained as TIFSDIAG) */
 static uint32_t tifs_prog_cnt, tifs_arm_cnt, tifs_cons_tx, tifs_cons_done,
-		tifs_stale_done, tifs_dup_cnt;
+		tifs_stale_done, tifs_dup_cnt, tifs_rearm_cnt, tifs_cons_norearm;
 
 /* Latch the tifs/phy that will PRODUCE the next CC0, at the moment the RX->TX switch is
  * programmed (peripheral prepare for the first switch; isr_tx for continuing switches).
@@ -189,6 +196,16 @@ static inline void tifs_on_rx_crc_ok(void)
 	if (tifs_capturing && !tifs_armed) {
 		tifs_armed = 1U;
 		tifs_arm_cnt++;
+	}
+}
+
+/* rev 7: note that the READY capture PPI was re-armed for the upcoming response TX (the
+ * actual PPI re-arm is bt_ctlr_tifs_rearm_ready_capture() in radio.c). */
+static inline void tifs_note_rearm(void)
+{
+	if (tifs_capturing) {
+		tifs_rearmed = 1U;
+		tifs_rearm_cnt++;
 	}
 }
 
@@ -224,6 +241,10 @@ static inline void tifs_consume(uint8_t via_done)
 	} else {
 		tifs_cons_tx++;
 	}
+	if (!tifs_rearmed) {
+		tifs_cons_norearm++;   /* CC0 is the STALE event-start RX READY, not response TX */
+	}
+	tifs_rearmed = 0U;
 	for (uint8_t i = 0U; i < TIFS_NBINS; i++) {
 		if (tifs_bins[i].used && tifs_bins[i].tifs == tifs_lat_tifs &&
 		    tifs_bins[i].phy == tifs_lat_phy) {
@@ -263,10 +284,11 @@ void bt_ctlr_tifs_clear(void)
 	(void)memset(tifs_bins, 0, sizeof(tifs_bins));   /* outside lock */
 	tifs_dropped = 0U;
 	tifs_prog_cnt = tifs_arm_cnt = tifs_cons_tx = tifs_cons_done = 0U;
-	tifs_stale_done = tifs_dup_cnt = 0U;
+	tifs_stale_done = tifs_dup_cnt = tifs_rearm_cnt = tifs_cons_norearm = 0U;
 
 	key = irq_lock();
 	tifs_armed = 0U;     /* drop any pre-clear pending sample */
+	tifs_rearmed = 0U;
 	tifs_lat_gen = 0U;
 	tifs_cons_gen = 0U;
 	tifs_capturing = 1U;             /* enable (tiny) */
@@ -329,12 +351,13 @@ uint32_t bt_ctlr_tifs_drain_fmt(char *buf, uint32_t buflen)
 	}
 	/* diagnostic reconciliation line (analyzer ignores it): switches programmed,
 	 * responses armed, consumes per route, stale/duplicate isr_done, drops. */
-	if ((buflen - used) >= 96U) {
+	if ((buflen - used) >= 128U) {
 		int w = snprintf(&buf[used], buflen - used,
 				 "TIFSDIAG prog=%u arm=%u cons_tx=%u cons_done=%u "
-				 "stale_done=%u dup=%u drop=%u\n",
+				 "stale_done=%u dup=%u rearm=%u cons_norearm=%u drop=%u\n",
 				 tifs_prog_cnt, tifs_arm_cnt, tifs_cons_tx, tifs_cons_done,
-				 tifs_stale_done, tifs_dup_cnt, drop);
+				 tifs_stale_done, tifs_dup_cnt, tifs_rearm_cnt,
+				 tifs_cons_norearm, drop);
 		if (w > 0) {
 			used += (uint32_t)w;
 		}
@@ -655,6 +678,18 @@ void lll_conn_isr_rx(void *param)
 
 		return;
 	}
+
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+	/* rev 7: on the PERIPHERAL, RE-ARM the READY capture for the upcoming RESPONSE TX
+	 * (lll_isr_rx_status_reset above disabled it). Placed after the no-RX return and
+	 * before packet processing -> ample time before the response-TX READY event, so
+	 * radio_tmr_ready_get() then reflects the response TX READY, not the stale RX one. */
+	if (((struct lll_conn *)param)->role) {
+		extern void bt_ctlr_tifs_rearm_ready_capture(void);
+		bt_ctlr_tifs_rearm_ready_capture();
+		tifs_note_rearm();
+	}
+#endif
 
 	trx_cnt++;
 

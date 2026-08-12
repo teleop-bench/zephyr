@@ -1804,6 +1804,20 @@ void radio_tmr_aa_capture(void)
 		BIT(HAL_RADIO_RECV_TIMEOUT_CANCEL_PPI));
 }
 
+#if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
+/* §6.1 BENCH-ONLY (M0, rev 7): re-arm ONLY the RADIO EVENTS_READY -> EVENT_TIMER
+ * CAPTURE[TRX] capture. radio_tmr_status_reset() disables it after RX, so without this
+ * the response-TX READY is never captured and radio_tmr_ready_get() returns the stale
+ * event-start RX READY. Unlike radio_tmr_aa_capture() this does NOT touch the
+ * receive-timeout-cancel PPI. Call from the peripheral RX ISR after the status reset. */
+void bt_ctlr_tifs_rearm_ready_capture(void);
+void bt_ctlr_tifs_rearm_ready_capture(void)
+{
+	hal_radio_ready_time_capture_ppi_config();
+	hal_radio_nrf_ppi_channels_enable(BIT(HAL_RADIO_READY_TIME_CAPTURE_PPI));
+}
+#endif /* CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH */
+
 uint32_t radio_tmr_aa_get(void)
 {
 	return EVENT_TIMER->CC[HAL_EVENT_TIMER_HCTO_CC_OFFSET];
