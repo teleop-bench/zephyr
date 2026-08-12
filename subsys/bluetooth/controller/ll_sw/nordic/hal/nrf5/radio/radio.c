@@ -1805,16 +1805,49 @@ void radio_tmr_aa_capture(void)
 }
 
 #if defined(CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH)
-/* §6.1 BENCH-ONLY (M0, rev 7): re-arm ONLY the RADIO EVENTS_READY -> EVENT_TIMER
- * CAPTURE[TRX] capture. radio_tmr_status_reset() disables it after RX, so without this
- * the response-TX READY is never captured and radio_tmr_ready_get() returns the stale
- * event-start RX READY. Unlike radio_tmr_aa_capture() this does NOT touch the
- * receive-timeout-cancel PPI. Call from the peripheral RX ISR after the status reset. */
-void bt_ctlr_tifs_rearm_ready_capture(void);
-void bt_ctlr_tifs_rearm_ready_capture(void)
+/* §6.1 BENCH-ONLY (M0, rev 8): capture the peripheral RESPONSE-TX READY into the
+ * DEDICATED sample CC (CC3 / SAMPLE task), leaving the controller-owned READY CC (CC0 /
+ * TRX) UNTOUCHED. rev-7 redirected READY into CC0 and cost ~28% peripheral RX (CC0 is
+ * reused by the radio's own capture+compare timing). RADIO EVENTS_READY already
+ * publishes to HAL_RADIO_READY_TIME_CAPTURE_PPI (set at event start); we only re-point
+ * the EVENT_TIMER subscriber from CC0 to CC3 for the response window, then restore CC0.
+ * CC3 is the HAL sample scratch register -- safe only with ISR profiling OFF and no FEM
+ * PA/LNA sampling (asserted). DPPI (nRF54L) only, which is the bench target. */
+BUILD_ASSERT(!IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR),
+	     "TIFS bench uses CC3 (sample task); BT_CTLR_PROFILE_ISR must be disabled");
+BUILD_ASSERT(!IS_ENABLED(CONFIG_MPSL_FEM) && !IS_ENABLED(CONFIG_BT_CTLR_FEM),
+	     "TIFS bench uses CC3 (sample task); not supported with an active FEM");
+
+void bt_ctlr_tifs_cc3_arm(void);
+void bt_ctlr_tifs_cc3_arm(void)
 {
-	hal_radio_ready_time_capture_ppi_config();
+	hal_radio_nrf_ppi_channels_disable(BIT(HAL_RADIO_READY_TIME_CAPTURE_PPI));
+	nrf_timer_subscribe_clear(EVENT_TIMER, HAL_EVENT_TIMER_READY_TASK);       /* CC0 off */
+	nrf_timer_subscribe_set(EVENT_TIMER, HAL_EVENT_TIMER_SAMPLE_TASK,         /* CC3 on  */
+				HAL_RADIO_READY_TIME_CAPTURE_PPI);
 	hal_radio_nrf_ppi_channels_enable(BIT(HAL_RADIO_READY_TIME_CAPTURE_PPI));
+}
+
+uint32_t bt_ctlr_tifs_cc3_read(void);
+uint32_t bt_ctlr_tifs_cc3_read(void)
+{
+	return EVENT_TIMER->CC[HAL_EVENT_TIMER_SAMPLE_CC_OFFSET];   /* CC3 */
+}
+
+void bt_ctlr_tifs_cc3_restore(void);
+void bt_ctlr_tifs_cc3_restore(void)
+{
+	hal_radio_nrf_ppi_channels_disable(BIT(HAL_RADIO_READY_TIME_CAPTURE_PPI));
+	nrf_timer_subscribe_clear(EVENT_TIMER, HAL_EVENT_TIMER_SAMPLE_TASK);      /* CC3 off */
+	nrf_timer_subscribe_set(EVENT_TIMER, HAL_EVENT_TIMER_READY_TASK,          /* CC0 back */
+				HAL_RADIO_READY_TIME_CAPTURE_PPI);
+	/* leave the channel DISABLED; normal event setup (radio_tmr_aa_capture) re-enables. */
+}
+
+uint32_t bt_ctlr_tifs_cc0_peek(void);
+uint32_t bt_ctlr_tifs_cc0_peek(void)
+{
+	return EVENT_TIMER->CC[HAL_EVENT_TIMER_TRX_CC_OFFSET];      /* CC0 (leak detector) */
 }
 #endif /* CONFIG_BT_CTLR_TIFS_CAPTURE_BENCH */
 
