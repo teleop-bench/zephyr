@@ -1518,6 +1518,17 @@ config BT_CTLR_FSU_BENCH_FORCE_FEAT
 	  implementation handles as clean procedure termination. Never
 	  enable outside the open<->open bench rig.
 
+config BT_CTLR_FSU_EVENTFILL_DIAG
+	bool "BENCH-ONLY: per-event packets/event histogram in isr_done"
+	help
+	  M0 FSU event-fill diagnostic: records trx_cnt (transactions per connection
+	  event) into lll_conn_q2_pe[] each event, for occupancy analysis. This runs
+	  on the hot radio path (isr_done) and measurably THROTTLES high-PDU-rate
+	  L2CAP CoC throughput (~20%: ~170 -> ~130 KB/s at 2M); GATT is barely
+	  affected. Leave OFF for any throughput benchmark; enable only when you
+	  need the packets/event occupancy stats. The lll_conn_q2_pe[] globals are
+	  always defined (zero cost) so apps that read them still link when this is off.
+
 config BT_CTLR_TIFS_CAPTURE_BENCH
 	bool "BENCH-ONLY: capture RX-PHYEND->TX-READY interval via EVENT_TIMER CC0"
 	help

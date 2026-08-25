@@ -44,6 +44,12 @@ volatile uint32_t lll_conn_q2_tx[40];    /* ACTUAL TX-completed pkts/chan */
 volatile uint32_t lll_conn_q2_session;   /* controller-owned, ++ per connect setup */
 volatile uint32_t lll_conn_q2_aa;        /* connection AA = shared id (both roles) */
 volatile uint8_t  lll_conn_q2_curchan = 255; /* ACTUAL remapped chan this event */
+/* FSU event-fill diagnostics (2026-08-12): packets/event histogram + FORCE_MD arm count.
+ * lll_conn_q2_pe[i] = # events that closed with trx_cnt==i (index 63 = 63+ overflow). */
+volatile uint16_t lll_conn_q2_pe[64];
+volatile uint16_t lll_conn_q2_pe_max;    /* max trx_cnt seen in any event */
+volatile uint32_t lll_conn_q2_events;    /* connection events closed */
+volatile uint32_t lll_conn_q2_fmd_arm;   /* FORCE_MD arm transitions (0 -> loaded) */
 
 #include "lll_internal.h"
 #include "lll_df_internal.h"
@@ -427,10 +433,24 @@ static uint8_t force_md_cnt;
 
 #define FORCE_MD_CNT_GET() force_md_cnt
 
+/* FSU event-fill: the arm threshold is normally trx_cnt >= ACL_TX_COUNT-1 (a deep pool then
+ * never arms). CONFIG_APP_FORCE_MD_ARM_AT decouples it to a fixed low count so FORCE_MD can
+ * hold the event open and let the deep queue fill it ("forced event-fill" — non-standard). */
+#if defined(CONFIG_APP_FORCE_MD_ARM_AT) && (CONFIG_APP_FORCE_MD_ARM_AT > 0)
+#define FMD_ARM_THRESH (CONFIG_APP_FORCE_MD_ARM_AT)
+#else
+#define FMD_ARM_THRESH ((CONFIG_BT_BUF_ACL_TX_COUNT) - 1)
+#endif
+/* BENCH-ONLY diagnostic tally, gated: keep it OFF for throughput runs (hot path). */
+#if defined(CONFIG_BT_CTLR_FSU_EVENTFILL_DIAG)
+#define FMD_ARM_TALLY() do { if (!force_md_cnt) { lll_conn_q2_fmd_arm++; } } while (false)
+#else
+#define FMD_ARM_TALLY() do { } while (false)
+#endif
 #define FORCE_MD_CNT_SET() \
 		do { \
-			if (force_md_cnt || \
-			    (trx_cnt >= ((CONFIG_BT_BUF_ACL_TX_COUNT) - 1))) { \
+			if (force_md_cnt || (trx_cnt >= FMD_ARM_THRESH)) { \
+				FMD_ARM_TALLY(); \
 				force_md_cnt = BT_CTLR_FORCE_MD_COUNT; \
 			} \
 		} while (false)
@@ -1495,6 +1515,13 @@ static void isr_done(void *param)
 #endif
 
 	lll_isr_status_reset();
+
+	/* FSU event-fill diagnostic (BENCH-ONLY, gated): record trx_cnt per event. This runs on the
+	 * hot radio path and throttles high-PDU-rate CoC throughput ~20% - keep OFF for throughput. */
+#if defined(CONFIG_BT_CTLR_FSU_EVENTFILL_DIAG)
+	{ uint16_t pe = trx_cnt; lll_conn_q2_pe[(pe < 63U) ? pe : 63U]++; lll_conn_q2_events++;
+	  if (pe > lll_conn_q2_pe_max) { lll_conn_q2_pe_max = pe; } }
+#endif
 
 	e = ull_event_done_extra_get();
 	LL_ASSERT_ERR(e);
