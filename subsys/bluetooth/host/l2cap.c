@@ -931,6 +931,13 @@ static bool chan_has_credits(struct bt_l2cap_le_chan *lechan)
 #endif
 }
 
+#if defined(CONFIG_BT_TESTING)
+/* TX-staging diagnostic: host->controller ACL fragments actually handed down (one bump per
+ * non-NULL l2cap_data_pull return). Compare to controller aired trx_cnt to tell an airtime-full
+ * event (host-handed == aired) from a downstream cap (host-handed >> aired). BENCH-ONLY. */
+volatile uint32_t l2cap_pull_pdus;
+#endif
+
 __weak void bt_test_l2cap_data_pull_spy(struct bt_conn *conn,
 					struct bt_l2cap_le_chan *lechan,
 					size_t amount,
@@ -1068,6 +1075,9 @@ struct net_buf *l2cap_data_pull(struct bt_conn *conn,
 		lechan->_pdu_remaining = 0;
 	}
 
+#if defined(CONFIG_BT_TESTING)
+	l2cap_pull_pdus++;
+#endif
 	return pdu;
 }
 
